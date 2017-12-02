@@ -386,7 +386,7 @@ void fullupdate() {
     for (partition in partitions) {
         def partitiondata = partition.value
         def partitioncode = partitiondata.code[0..2]
-        log.debug "partitioncode: ${partitioncode}"
+        //log.debug "partitioncode: ${partitioncode}"
         if (partitioncode == "652") {
             def partitionmode = partitiondata.code[3..4]
             updatePartition("${partitioncode}","${partitionmode}")
@@ -397,7 +397,21 @@ void fullupdate() {
 
     def zones = request.JSON?.zone
     for (zone in zones) {
-        log.debug "zone"+zone.key+" -- ${zone.value.code[0..2]}"
+        def zoneStatusMap = [
+            '601':"alarm",
+            '602':"closed",
+            '603':"tamper",
+            '604':"tamper restore",
+            '605':"fault",
+            '606':"fault restore",
+            '609':"open",
+            '610':"closed"
+        ]
+
+        def zoneStatus = zoneStatusMap."${zone.value.code[0..2]}"
+		if (!zoneStatus) zoneStatus = "???"
+
+		log.debug "Received Zone"+zone.key+" status of ${zone.value.code[0..2]} [$zoneStatus]"
         updateZone("${zone.value.code[0..2]}","zone"+zone.key)
     }
 }
@@ -411,7 +425,7 @@ def zonejsonupdate() {
 
 def partitionjsonupdate() {
     def partition = request.JSON
-    log.debug "Json: ${request.JSON}"
+    log.debug "Received from Alarm Bridge Json request: ${request.JSON}"
     if (partition.code == "652") {
         updatePartition("${partition.code}","${partition.mode}")
     } else {
@@ -436,14 +450,14 @@ private updateZone(String eventCode, String zone) {
             if (!zonedevice) {
 
             } else {
-                log.debug "Was True... Zone Device: $zonedevice.displayName at $zonedevice.deviceNetworkId is ${event}"
+                log.debug "Zone update received from Alarm Bridge: $zonedevice.deviceNetworkId [$zonedevice.displayName] is ${event}"
                 if ("${zonedevice.latestValue("contact")}" != "${event}") {
                     zonedevice.zone("${event}")
                     def lanaddress = "${settings.xbmcserver}:${settings.xbmcport}"
                     def deviceNetworkId = "1234"
                     def json = new JsonBuilder()
                     def messagetitle = "$zonedevice.displayName".replaceAll(' ','%20')
-                    log.debug "$messagetitle"
+                    //log.debug "$messagetitle"
                     json.call("jsonrpc":"2.0","method":"GUI.ShowNotification","params":[title: "$messagetitle",message: "${event}"],"id":1)
                     def xbmcmessage = "/jsonrpc?request="+json.toString()
                     def result = new physicalgraph.device.HubAction("""GET $xbmcmessage HTTP/1.1\r\nHOST: $lanaddress\r\n\r\n""", physicalgraph.device.Protocol.LAN, "${deviceNetworkId}")
@@ -457,7 +471,11 @@ private updateZone(String eventCode, String zone) {
 }
 
 private updatePartition(String eventCode, String eventMode) {
-    log.debug "updatePartition: ${eventCode}, eventMode: ${eventMode}"
+	if (eventMode) {
+	    log.debug "Partition update received from Alarm Bridge: ${eventCode}, eventMode: ${eventMode}"
+    } else {
+	    log.debug "Partition update received from Alarm Bridge: ${eventCode}"
+    }
 
     if (eventCode) {
         def eventMap = [
@@ -475,8 +493,23 @@ private updatePartition(String eventCode, String eventMode) {
         def event = eventMap."${eventCode}"
 
         if (event) {
-            log.debug "It was a partition...  ${event}... ${eventMode}"
-            if ("${event}" == 'disarmed') {
+			if (eventMode) {
+				log.debug "Partition event received: ${event} [${eventMode}]"
+			} else {
+				log.debug "Partition event received: ${event}"
+			}
+            if ("${event}" == 'ready') {
+            	if(smartmonitor == "Yes") {
+                	log.debug "DSC reporting Ready"
+                }
+			}
+			if ("${event}" == 'notready') {
+            	if(smartmonitor == "Yes") {
+                	log.debug "DSC reporting Not Ready"
+                }
+            }
+
+			if ("${event}" == 'disarmed') {
             	setSmartHomeMonitor("off")
                 if (disarmMode) {
                     setLocationMode(disarmMode)
@@ -531,7 +564,7 @@ private updatePartition(String eventCode, String eventMode) {
                                 setLocationMode(awayMode)
                             }
                         }
-                        if ("${eventMode}" == '3' || "${eventMode}" == '2') { //armed w/zero entry delay
+                        if ("${eventMode}" == '3' || "${eventMode}" == '2' || "${eventMode}" == '1') { //armed w/zero entry delay
                         	setSmartHomeMonitor("stay")
                             if (nightMode) {
                                 setLocationMode(nightMode)
@@ -583,13 +616,13 @@ def lockHandler(evt) {
 }
 
 def modeChangeHandler(evt) {
-    log.debug "This event name is ${evt.name}"
+    log.debug "Mode changed, event is ${evt.name} [${evt.value}], happened at ${evt.date}"
 
     // get the value of this event, e.g., "on" or "off"
-    log.debug "The value of this event is ${evt.value}"
+    //log.debug "The value of this event is ${evt.value}"
 
     // get the Date this event happened at
-    log.debug "This event happened at ${evt.date}"
+    //log.debug "This event happened at ${evt.date}"
 
     // did the value of this event change from its previous state?
     log.debug "The value of this event is different from its previous value: ${evt.isStateChange()}"
@@ -622,9 +655,24 @@ def modeChangeHandler(evt) {
 private setSmartHomeMonitor(status)
 {
 	//Let's make sure the user turned on Smart Home Monitor Integration and the value I'm trying to set it to isn't already set
+    def currentStatus = location.currentState("alarmSystemStatus").value
 	if(smartmonitor == "Yes" && location.currentState("alarmSystemStatus").value != status)
     {
-    	log.debug "Set Smart Home Monitor to $status"
+	    log.debug "Sedning update to Smart Home Monitor which is currently $currentStatus to value $status"
+    	//log.debug "Set Smart Home Monitor to $status"
     	sendLocationEvent(name: "alarmSystemStatus", value: status)
     }
+}
+
+//When a button is pressed in Smart Home Monitor, this will capture the event and send that to Alarm Server
+//It will also sync the status change over to the DSC Command Switch
+def alarmStatusUpdate(evt) {
+    log.debug "Event Status updated to value: ${evt.value}"
+    if (evt.value == "stay") {
+        dscthing.nightarm()
+    } else if (evt.value == "off") {
+        dscthing.disarm()
+    } else if (evt.value == "away") {
+        dscthing.arm()
+    }    
 }
